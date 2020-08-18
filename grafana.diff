@@ -1,0 +1,286 @@
+diff --git a/pkg/api/dashboard.go b/pkg/api/dashboard.go
+index 17d6aace4b..9b98f44ff1 100644
+--- a/pkg/api/dashboard.go
++++ b/pkg/api/dashboard.go
+@@ -3,7 +3,6 @@ package api
+ import (
+ 	"encoding/json"
+ 	"fmt"
+-	"os"
+ 	"path"
+ 	"path/filepath"
+ 
+@@ -12,6 +11,7 @@ import (
+ 	"github.com/grafana/grafana/pkg/services/dashboards"
+ 
+ 	"github.com/grafana/grafana/pkg/api/dtos"
++	"github.com/grafana/grafana/pkg/assets"
+ 	"github.com/grafana/grafana/pkg/bus"
+ 	"github.com/grafana/grafana/pkg/components/dashdiffs"
+ 	"github.com/grafana/grafana/pkg/components/simplejson"
+@@ -333,7 +333,7 @@ func GetHomeDashboard(c *models.ReqContext) Response {
+ 	}
+ 
+ 	filePath := path.Join(setting.StaticRootPath, "dashboards/home.json")
+-	file, err := os.Open(filePath)
++	file, err := assets.Fs.Open(filePath)
+ 	if err != nil {
+ 		return Error(500, "Failed to load home dashboard", err)
+ 	}
+diff --git a/pkg/api/http_server.go b/pkg/api/http_server.go
+index fbf611bc16..22ee538374 100644
+--- a/pkg/api/http_server.go
++++ b/pkg/api/http_server.go
+@@ -15,6 +15,7 @@ import (
+ 	"github.com/grafana/grafana/pkg/api/live"
+ 	"github.com/grafana/grafana/pkg/api/routing"
+ 	httpstatic "github.com/grafana/grafana/pkg/api/static"
++	"github.com/grafana/grafana/pkg/assets"
+ 	"github.com/grafana/grafana/pkg/bus"
+ 	"github.com/grafana/grafana/pkg/components/simplejson"
+ 	"github.com/grafana/grafana/pkg/infra/localcache"
+@@ -307,9 +308,9 @@ func (hs *HTTPServer) addMiddlewaresAndStaticRoutes() {
+ 	}
+ 
+ 	m.Use(macaron.Renderer(macaron.RenderOptions{
+-		Directory:  path.Join(setting.StaticRootPath, "views"),
+-		IndentJSON: macaron.Env != macaron.PROD,
+-		Delims:     macaron.Delims{Left: "[[", Right: "]]"},
++		IndentJSON:         macaron.Env != macaron.PROD,
++		Delims:             macaron.Delims{Left: "[[", Right: "]]"},
++		TemplateFileSystem: assets.NewTemplateFileSystem(path.Join(setting.StaticRootPath, "views")),
+ 	}))
+ 
+ 	m.Use(hs.healthHandler)
+@@ -395,8 +396,8 @@ func (hs *HTTPServer) mapStatic(m *macaron.Macaron, rootDir string, dir string,
+ 		path.Join(rootDir, dir),
+ 		httpstatic.StaticOptions{
+ 			SkipLogging: true,
+-			Prefix:      prefix,
+ 			AddHeaders:  headers,
++			FileSystem:  assets.AssetFile(),
+ 		},
+ 	))
+ }
+diff --git a/pkg/assets/fs.go b/pkg/assets/fs.go
+new file mode 100644
+index 0000000000..3088213a82
+--- /dev/null
++++ b/pkg/assets/fs.go
+@@ -0,0 +1,16 @@
++package assets
++
++import (
++	"github.com/spf13/afero"
++	"github.com/breeswish/go-bindata-afero"
++)
++
++var Fs afero.Fs = afero.NewMemMapFs()
++
++func InitFs(basePath string) {
++	Fs = afero.NewMemMapFs()
++	err := bindataafero.WriteAssetsInDirectory(Fs, Asset, AssetInfo, AssetDir, basePath, "", "")
++	if err != nil {
++		panic(err)
++	}
++}
+diff --git a/pkg/assets/macaron.go b/pkg/assets/macaron.go
+new file mode 100644
+index 0000000000..59820f48ee
+--- /dev/null
++++ b/pkg/assets/macaron.go
+@@ -0,0 +1,57 @@
++package assets
++
++import (
++	"bytes"
++	"fmt"
++	"io"
++	"os"
++	"path/filepath"
++
++	"github.com/spf13/afero"
++	"gopkg.in/macaron.v1"
++)
++
++type TplFileSystem struct {
++	files []macaron.TemplateFile
++}
++
++func NewTemplateFileSystem(filterBaseDirectory string) macaron.TemplateFileSystem {
++	tplFs := TplFileSystem{
++		files: make([]macaron.TemplateFile, 0, 10),
++	}
++	exts := []string{".tmpl", ".html"}
++	afero.Walk(Fs, filterBaseDirectory, func(path string, info os.FileInfo, err error) error {
++		if err != nil {
++			return nil
++		}
++		r, err := filepath.Rel(filterBaseDirectory, path)
++		ext := macaron.GetExt(path)
++		for _, extension := range exts {
++			if ext != extension {
++				continue
++			}
++			data, err := afero.ReadFile(Fs, path)
++			if err != nil {
++				return nil
++			}
++			name := filepath.ToSlash((r[0 : len(r)-len(ext)]))
++			tplFs.files = append(tplFs.files, macaron.NewTplFile(name, data, ext))
++		}
++		return nil
++	})
++
++	return tplFs
++}
++
++func (fs TplFileSystem) ListFiles() []macaron.TemplateFile {
++	return fs.files
++}
++
++func (fs TplFileSystem) Get(name string) (io.Reader, error) {
++	for i := range fs.files {
++		if fs.files[i].Name()+fs.files[i].Ext() == name {
++			return bytes.NewReader(fs.files[i].Data()), nil
++		}
++	}
++	return nil, fmt.Errorf("file '%s' not found", name)
++}
+diff --git a/pkg/plugins/plugins.go b/pkg/plugins/plugins.go
+index 7d929e11e6..59f0ae8cf0 100644
+--- a/pkg/plugins/plugins.go
++++ b/pkg/plugins/plugins.go
+@@ -5,7 +5,6 @@ import (
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
+-	"io/ioutil"
+ 	"os"
+ 	"path"
+ 	"path/filepath"
+@@ -13,6 +12,7 @@ import (
+ 	"strings"
+ 	"time"
+ 
++	"github.com/grafana/grafana/pkg/assets"
+ 	"github.com/grafana/grafana/pkg/infra/log"
+ 	"github.com/grafana/grafana/pkg/infra/metrics"
+ 	"github.com/grafana/grafana/pkg/plugins/backendplugin"
+@@ -20,6 +20,7 @@ import (
+ 	"github.com/grafana/grafana/pkg/setting"
+ 	"github.com/grafana/grafana/pkg/util"
+ 	"github.com/grafana/grafana/pkg/util/errutil"
++	"github.com/spf13/afero"
+ 	"golang.org/x/xerrors"
+ )
+ 
+@@ -166,7 +167,7 @@ func (pm *PluginManager) scan(pluginDir string) error {
+ 		backendPluginManager: pm.BackendPluginManager,
+ 	}
+ 
+-	if err := util.Walk(pluginDir, true, true, scanner.walker); err != nil {
++	if err := afero.Walk(assets.Fs, pluginDir, scanner.walker); err != nil {
+ 		if xerrors.Is(err, os.ErrNotExist) {
+ 			pm.log.Debug("Couldn't scan dir '%s' since it doesn't exist")
+ 			return nil
+@@ -225,7 +226,7 @@ func (scanner *PluginScanner) walker(currentPath string, f os.FileInfo, err erro
+ 
+ func (scanner *PluginScanner) loadPluginJson(pluginJsonFilePath string) error {
+ 	currentDir := filepath.Dir(pluginJsonFilePath)
+-	reader, err := os.Open(pluginJsonFilePath)
++	reader, err := assets.Fs.Open(pluginJsonFilePath)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -252,7 +253,7 @@ func (scanner *PluginScanner) loadPluginJson(pluginJsonFilePath string) error {
+ 	// External plugins need a module.js file for SystemJS to load
+ 	if !strings.HasPrefix(pluginJsonFilePath, setting.StaticRootPath) && !scanner.IsBackendOnlyPlugin(pluginCommon.Type) {
+ 		module := filepath.Join(filepath.Dir(pluginJsonFilePath), "module.js")
+-		if _, err := os.Stat(module); os.IsNotExist(err) {
++		if _, err := assets.Fs.Stat(module); os.IsNotExist(err) {
+ 			plog.Warn("Plugin missing module.js",
+ 				"name", pluginCommon.Name,
+ 				"warning", "Missing module.js, If you loaded this plugin from git, make sure to compile it.",
+@@ -277,15 +278,15 @@ func GetPluginMarkdown(pluginId string, name string) ([]byte, error) {
+ 	}
+ 
+ 	path := filepath.Join(plug.PluginDir, fmt.Sprintf("%s.md", strings.ToUpper(name)))
+-	if _, err := os.Stat(path); os.IsNotExist(err) {
++	if _, err := assets.Fs.Stat(path); os.IsNotExist(err) {
+ 		path = filepath.Join(plug.PluginDir, fmt.Sprintf("%s.md", strings.ToLower(name)))
+ 	}
+ 
+-	if _, err := os.Stat(path); os.IsNotExist(err) {
++	if _, err := assets.Fs.Stat(path); os.IsNotExist(err) {
+ 		return make([]byte, 0), nil
+ 	}
+ 
+-	data, err := ioutil.ReadFile(path)
++	data, err := afero.ReadFile(assets.Fs, path)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+diff --git a/pkg/services/notifications/notifications.go b/pkg/services/notifications/notifications.go
+index ce0d84a0a9..fa2be9c65c 100644
+--- a/pkg/services/notifications/notifications.go
++++ b/pkg/services/notifications/notifications.go
+@@ -9,6 +9,7 @@ import (
+ 	"path/filepath"
+ 	"strings"
+ 
++	"github.com/grafana/grafana/pkg/assets"
+ 	"github.com/grafana/grafana/pkg/bus"
+ 	"github.com/grafana/grafana/pkg/events"
+ 	"github.com/grafana/grafana/pkg/infra/log"
+@@ -16,6 +17,7 @@ import (
+ 	"github.com/grafana/grafana/pkg/registry"
+ 	"github.com/grafana/grafana/pkg/setting"
+ 	"github.com/grafana/grafana/pkg/util"
++	"github.com/spf13/afero"
+ )
+ 
+ var mailTemplates *template.Template
+@@ -57,10 +59,20 @@ func (ns *NotificationService) Init() error {
+ 	})
+ 
+ 	templatePattern := filepath.Join(setting.StaticRootPath, ns.Cfg.Smtp.TemplatesPattern)
+-	_, err := mailTemplates.ParseGlob(templatePattern)
++	files, err := afero.Glob(assets.Fs, templatePattern)
+ 	if err != nil {
+ 		return err
+ 	}
++	for _, filename := range files {
++		b, err := afero.ReadFile(assets.Fs, filename)
++		if err != nil {
++			return err
++		}
++		_, err = mailTemplates.New(filepath.Base(filename)).Parse(string(b))
++		if err != nil {
++			return err
++		}
++	}
+ 
+ 	if !util.IsEmail(ns.Cfg.Smtp.FromAddress) {
+ 		return errors.New("Invalid email address for SMTP from_address config")
+diff --git a/pkg/setting/setting.go b/pkg/setting/setting.go
+index ddcb761d5d..bdc734305b 100644
+--- a/pkg/setting/setting.go
++++ b/pkg/setting/setting.go
+@@ -20,6 +20,7 @@ import (
+ 	"github.com/go-macaron/session"
+ 	ini "gopkg.in/ini.v1"
+ 
++	"github.com/grafana/grafana/pkg/assets"
+ 	"github.com/grafana/grafana/pkg/infra/log"
+ 	"github.com/grafana/grafana/pkg/util"
+ )
+@@ -573,6 +574,8 @@ func setHomePath(args *CommandLineArgs) {
+ 	}
+ 
+ 	HomePath, _ = filepath.Abs(".")
++	assets.InitFs(HomePath)
++
+ 	// check if homepath is correct
+ 	if pathExists(filepath.Join(HomePath, "conf/defaults.ini")) {
+ 		return
