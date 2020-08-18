@@ -1,4 +1,4 @@
-module github.com/breeswish/grafana-standlone
+module github.com/breeswish/grafana-standalone
 
 go 1.14
 

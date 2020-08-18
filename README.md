@@ -1,4 +1,4 @@
-# grafana-standlone
+# grafana-standalone
 
 A set of patches to build a standalone Grafana. Currently work for Grafana v6.7.1.
 
